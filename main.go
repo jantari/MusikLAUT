@@ -23,6 +23,9 @@ import (
 
     // Launching the OS-native browser with the login-link
 	"github.com/pkg/browser"
+
+    // For mDNS-based device discovery
+    "github.com/grandcat/zeroconf"
 )
 
 var scopes = []string { "user-read-playback-state", "user-modify-playback-state" }
@@ -185,6 +188,40 @@ func main() {
 
     fmt.Println("Starting")
 
+    fmt.Println("mDNS discovery")
+    // Discover all services on the network
+    resolver, err := zeroconf.NewResolver(nil)
+    if err != nil {
+        log.Fatalln("Failed to initialize resolver:", err.Error())
+    }
+
+    entries := make(chan *zeroconf.ServiceEntry)
+    go func(results <-chan *zeroconf.ServiceEntry) {
+        for entry := range results {
+            //log.Println(entry)
+            var zeroConfPath string
+            for _, val := range(entry.Text) {
+                if strings.HasPrefix(val, "CPath=") {
+                    zeroConfPath = strings.TrimPrefix(val, "CPath=")
+                }
+            }
+            fmt.Printf("Spotify Connect device: %v, query http://%v:%v%v?action=getInfo\n", entry.Instance, entry.HostName, entry.Port, zeroConfPath)
+            fmt.Printf("  IPs: %v %v\n", entry.AddrIPv4, entry.AddrIPv6)
+        }
+        log.Println("No more entries.")
+    }(entries)
+
+    ctx, cancel := context.WithTimeout(context.Background(), time.Second*5)
+    defer cancel()
+    err = resolver.Browse(ctx, "_spotify-connect._tcp", "local.", entries)
+    if err != nil {
+        log.Fatalln("Failed to browse:", err.Error())
+    }
+
+    <-ctx.Done()
+
+    fmt.Println("Login & API-based connections")
+
     httpServerExitDone := &sync.WaitGroup{}
     httpServerExitDone.Add(1)
 
@@ -270,7 +307,7 @@ func main() {
         }
     }
     if deviceId == "" {
-        log.Fatal("Spoyify Device with the name '%v' could not be found (offline?)")
+        log.Fatalf("Spotify device with the name '%v' could not be found (offline?)", *deviceNamePtr)
     }
 
     // Get current playback status (e.g. currently active device)
