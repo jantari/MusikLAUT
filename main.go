@@ -1,31 +1,33 @@
 package main
 
 import (
-    "os"
 	"bytes"
 	"context"
+    "net"
 	"crypto/rand"
-    "flag"
-    "errors"
 	"encoding/base64"
 	json "encoding/json/v2"
+    "encoding/json/jsontext"
+	"errors"
+	"flag"
 	"fmt"
 	"io"
 	"log"
 	"net/http"
 	"net/url"
+	"os"
 	"strings"
 	"sync"
 	"time"
 
-    // Configuration
-    "github.com/peterbourgon/ff/v3"
+	// Configuration
+	"github.com/peterbourgon/ff/v3"
 
-    // Launching the OS-native browser with the login-link
+	// Launching the OS-native browser with the login-link
 	"github.com/pkg/browser"
 
-    // For mDNS-based device discovery
-    "github.com/grandcat/zeroconf"
+	// For mDNS-based device discovery
+	"github.com/grandcat/zeroconf"
 )
 
 var scopes = []string { "user-read-playback-state", "user-modify-playback-state" }
@@ -70,6 +72,47 @@ type SpotifyDevice struct {
     VolumePercent    int    `json:"volume_percent"`
 }
 
+type mDNSSpotifyDevice struct {
+    ZeroConfBaseURL string
+    MDNSHostname    string
+    IPv4Addresses   []net.IP
+    IPv6Addresses   []net.IP
+
+    ZeroConfInfo    mDNSSpotifyDeviceInfo
+}
+
+type mDNSSpotifyDeviceInfo struct {
+    Availability     string `json:"availability"`
+    BrandDisplayName string `json:"brandDisplayName"`
+    ClientId         string `json:"clientID"`
+    DeviceId         string `json:"deviceID"`
+    DeviceType       string `json:"deviceType"`
+    GroupStatus      string `json:"groupStatus"`
+    LibraryVersion   string `json:"libraryVersion"`
+    ModelDisplayName string `json:"modelDisplayName"`
+    ProductId        int    `json:"productID"`
+    PublicKey        string `json:"publicKey"`
+    RemoteName       string `json:"remoteName"`
+    ResolverVersion  string `json:"resolverVersion"`
+    Scope            string `json:"scope"`
+    SpotifyError     int    `json:"spotifyError"`
+    Status           int    `json:"status"`
+    StatusString     string `json:"statusString"`
+    TokenType        string `json:"tokenType"`
+    Version          string `json:"version"`
+    SupportedCapabilities int `json:"supported_capabilities"`
+}
+
+func PrintJSON(obj interface{}) {
+    b, _ := json.Marshal(
+        obj,
+        json.OmitZeroStructFields(true),
+        json.StringifyNumbers(true),
+        jsontext.WithIndent("  "),
+    )
+    fmt.Println(string(b))
+}
+
 func randString(nByte int) (string, error) {
     b := make([]byte, nByte)
     if _, err := io.ReadFull(rand.Reader, b); err != nil {
@@ -108,6 +151,75 @@ func startCallbackListenerAsync(wg *sync.WaitGroup) *http.Server {
 
     // returning reference so caller can call Shutdown()
     return srv
+}
+
+func mDnsDiscoverDevicesAsync(searchTime time.Duration) []mDNSSpotifyDevice {
+    var discoveredDevices []mDNSSpotifyDevice
+    fmt.Println("mDNS discovery")
+    // Discover all services on the network
+    resolver, err := zeroconf.NewResolver(nil)
+    if err != nil {
+        log.Fatalln("Failed to initialize resolver:", err.Error())
+    }
+
+    entries := make(chan *zeroconf.ServiceEntry)
+    go func(results <-chan *zeroconf.ServiceEntry) {
+        for entry := range results {
+            //log.Println(entry)
+            var zeroConfPath string
+            for _, val := range(entry.Text) {
+                if strings.HasPrefix(val, "CPath=") {
+                    zeroConfPath = strings.TrimPrefix(val, "CPath=")
+                }
+            }
+            fmt.Printf("Spotify Connect device: %v, query http://%v:%v%v?action=getInfo\n", entry.Instance, entry.HostName, entry.Port, zeroConfPath)
+
+            req, err := http.NewRequest("GET", fmt.Sprintf("http://%v:%v%v?action=getInfo", entry.HostName, entry.Port, zeroConfPath), nil)
+            if err != nil {
+                log.Fatal(err)
+            }
+
+            client := &http.Client{}
+            resp, err := client.Do(req)
+            if err != nil {
+                log.Fatal(err)
+            }
+            defer resp.Body.Close()
+
+            fmt.Println("response Status:", resp.Status)
+            fmt.Println("response Headers:", resp.Header)
+            body, _ := io.ReadAll(resp.Body)
+            //fmt.Println("response Body:", string(body))
+
+            var device mDNSSpotifyDevice
+            var deviceZC mDNSSpotifyDeviceInfo
+            if err := json.Unmarshal(body, &deviceZC); err != nil {   // Parse []byte to go struct pointer
+                log.Println("mDNS Can not unmarshal zeroconf JSON")
+            }
+
+            device.ZeroConfBaseURL = fmt.Sprintf(":%v%v", entry.Port, zeroConfPath)
+            device.ZeroConfInfo    = deviceZC
+            device.MDNSHostname    = entry.HostName
+            device.IPv4Addresses   = entry.AddrIPv4
+            device.IPv6Addresses   = entry.AddrIPv6
+
+            discoveredDevices = append(discoveredDevices, device)
+
+            PrintJSON(device)
+        }
+        log.Println("mDNS No more entries.")
+    }(entries)
+
+    ctx, cancel := context.WithTimeout(context.Background(), searchTime)
+    defer cancel()
+    err = resolver.Browse(ctx, "_spotify-connect._tcp", "local.", entries)
+    if err != nil {
+        log.Println("mDNS Failed to browse:", err.Error())
+    }
+
+    <-ctx.Done()
+
+    return discoveredDevices
 }
 
 func startAuthorizeFlow(clientId string) {
@@ -186,39 +298,12 @@ func main() {
         os.Exit(2)
     }
 
+    if *clientIdPtr == "" || *clientSecretPtr == "" {
+        log.Fatal("clientId and clientSecret are required")
+    }
+
     fmt.Println("Starting")
-
-    fmt.Println("mDNS discovery")
-    // Discover all services on the network
-    resolver, err := zeroconf.NewResolver(nil)
-    if err != nil {
-        log.Fatalln("Failed to initialize resolver:", err.Error())
-    }
-
-    entries := make(chan *zeroconf.ServiceEntry)
-    go func(results <-chan *zeroconf.ServiceEntry) {
-        for entry := range results {
-            //log.Println(entry)
-            var zeroConfPath string
-            for _, val := range(entry.Text) {
-                if strings.HasPrefix(val, "CPath=") {
-                    zeroConfPath = strings.TrimPrefix(val, "CPath=")
-                }
-            }
-            fmt.Printf("Spotify Connect device: %v, query http://%v:%v%v?action=getInfo\n", entry.Instance, entry.HostName, entry.Port, zeroConfPath)
-            fmt.Printf("  IPs: %v %v\n", entry.AddrIPv4, entry.AddrIPv6)
-        }
-        log.Println("No more entries.")
-    }(entries)
-
-    ctx, cancel := context.WithTimeout(context.Background(), time.Second*5)
-    defer cancel()
-    err = resolver.Browse(ctx, "_spotify-connect._tcp", "local.", entries)
-    if err != nil {
-        log.Fatalln("Failed to browse:", err.Error())
-    }
-
-    <-ctx.Done()
+    mDnsDiscoverDevicesAsync(5 * time.Second)
 
     fmt.Println("Login & API-based connections")
 
@@ -231,7 +316,7 @@ func main() {
 
     // TODO don't just wait a random time, kill the server + continue when the URL handler is called
     fmt.Println("Waiting for callback ...")
-    time.Sleep(1 * time.Second)
+    time.Sleep(8 * time.Second)
 
     if err := srv.Shutdown(context.TODO()); err != nil {
         panic(err) // failure/timeout shutting down the server gracefully
@@ -241,6 +326,7 @@ func main() {
     fmt.Println(authorizationCode)
 
     data := url.Values{}
+    //data.Set("grant_type", "authorization_code")
     data.Set("grant_type", "authorization_code")
     data.Set("code", authorizationCode)
     data.Set("redirect_uri", "http://127.0.0.1:1235/redirect")
