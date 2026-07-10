@@ -1,36 +1,43 @@
 package main
 
 import (
-	"bytes"
-	"context"
-    "net"
-	"crypto/rand"
-	"encoding/base64"
-	json "encoding/json/v2"
+    "bytes"
+    "context"
+    "crypto/aes"
+    "crypto/cipher"
+    "crypto/hmac"
+    "crypto/rand"
+    "crypto/sha1"
+    "encoding/base64"
     "encoding/json/jsontext"
-	"errors"
-	"flag"
-	"fmt"
-	"io"
-	"log"
-	"net/http"
-	"net/url"
-	"os"
-	"strings"
-	"sync"
-	"time"
+    json "encoding/json/v2"
+    "errors"
+    "flag"
+    "fmt"
+    "io"
+    "log"
+    "net"
+    "net/http"
+    "net/url"
+    "os"
+    "strings"
+    "sync"
+    "time"
 
-	// Configuration
-	"github.com/peterbourgon/ff/v3"
+    // Internal imports
+    "MusikLAUT/dh"
 
-	// Launching the OS-native browser with the login-link
-	"github.com/pkg/browser"
+    // Configuration
+    "github.com/peterbourgon/ff/v3"
 
-	// For mDNS-based device discovery
-	"github.com/grandcat/zeroconf"
+    // Launching the OS-native browser with the login-link
+    "github.com/pkg/browser"
+
+    // For mDNS-based device discovery
+    "github.com/grandcat/zeroconf"
 )
 
-var scopes = []string { "user-read-playback-state", "user-modify-playback-state" }
+var scopes = []string{"user-read-playback-state", "user-modify-playback-state"}
 
 var authorizationCode = ""
 var accessToken = ""
@@ -82,25 +89,25 @@ type mDNSSpotifyDevice struct {
 }
 
 type mDNSSpotifyDeviceInfo struct {
-    Availability     string `json:"availability"`
-    BrandDisplayName string `json:"brandDisplayName"`
-    ClientId         string `json:"clientID"`
-    DeviceId         string `json:"deviceID"`
-    DeviceType       string `json:"deviceType"`
-    GroupStatus      string `json:"groupStatus"`
-    LibraryVersion   string `json:"libraryVersion"`
-    ModelDisplayName string `json:"modelDisplayName"`
-    ProductId        int    `json:"productID"`
-    PublicKey        string `json:"publicKey"`
-    RemoteName       string `json:"remoteName"`
-    ResolverVersion  string `json:"resolverVersion"`
-    Scope            string `json:"scope"`
-    SpotifyError     int    `json:"spotifyError"`
-    Status           int    `json:"status"`
-    StatusString     string `json:"statusString"`
-    TokenType        string `json:"tokenType"`
-    Version          string `json:"version"`
-    SupportedCapabilities int `json:"supported_capabilities"`
+    Availability          string `json:"availability"`
+    BrandDisplayName      string `json:"brandDisplayName"`
+    ClientId              string `json:"clientID"`
+    DeviceId              string `json:"deviceID"`
+    DeviceType            string `json:"deviceType"`
+    GroupStatus           string `json:"groupStatus"`
+    LibraryVersion        string `json:"libraryVersion"`
+    ModelDisplayName      string `json:"modelDisplayName"`
+    ProductId             int    `json:"productID"`
+    PublicKey             string `json:"publicKey"`
+    RemoteName            string `json:"remoteName"`
+    ResolverVersion       string `json:"resolverVersion"`
+    Scope                 string `json:"scope"`
+    SpotifyError          int    `json:"spotifyError"`
+    Status                int    `json:"status"`
+    StatusString          string `json:"statusString"`
+    TokenType             string `json:"tokenType"`
+    Version               string `json:"version"`
+    SupportedCapabilities int    `json:"supported_capabilities"`
 }
 
 func PrintJSON(obj interface{}) {
@@ -115,7 +122,8 @@ func PrintJSON(obj interface{}) {
 
 func randString(nByte int) (string, error) {
     b := make([]byte, nByte)
-    if _, err := io.ReadFull(rand.Reader, b); err != nil {
+
+    if _, err := rand.Read(b); err != nil {
         return "", err
     }
     return base64.RawURLEncoding.EncodeToString(b), nil
@@ -153,6 +161,25 @@ func startCallbackListenerAsync(wg *sync.WaitGroup) *http.Server {
     return srv
 }
 
+type apResolveResponse struct {
+    Accesspoint []string `json:"accesspoint,omitempty"`
+    Dealer      []string `json:"dealer,omitempty"`
+    Spclient    []string `json:"spclient,omitempty"`
+}
+
+func obtainReusableCredentialsBlob() error {
+    // Turns out doing this the real way is far too complicated.
+    // If I implement this, it's going to be by starting librespot
+    // or librespot-go as a separate process and waiting for the
+    // credentials blob to show up in their state/config files
+
+    // See librespot-go source for how it would be done (connect to ap, speak protobuf via socket):
+    // https://github.com/devgianlu/go-librespot/blob/master/session/session.go#L34
+    // https://github.com/devgianlu/go-librespot/blob/master/ap/ap.go#L120
+    // https://github.com/devgianlu/go-librespot/blob/master/ap/ap.go#L550
+    return nil
+}
+
 func mDnsDiscoverDevicesAsync(searchTime time.Duration) []mDNSSpotifyDevice {
     var discoveredDevices []mDNSSpotifyDevice
     fmt.Println("mDNS discovery")
@@ -167,7 +194,7 @@ func mDnsDiscoverDevicesAsync(searchTime time.Duration) []mDNSSpotifyDevice {
         for entry := range results {
             //log.Println(entry)
             var zeroConfPath string
-            for _, val := range(entry.Text) {
+            for _, val := range entry.Text {
                 if strings.HasPrefix(val, "CPath=") {
                     zeroConfPath = strings.TrimPrefix(val, "CPath=")
                 }
@@ -193,7 +220,7 @@ func mDnsDiscoverDevicesAsync(searchTime time.Duration) []mDNSSpotifyDevice {
 
             var device mDNSSpotifyDevice
             var deviceZC mDNSSpotifyDeviceInfo
-            if err := json.Unmarshal(body, &deviceZC); err != nil {   // Parse []byte to go struct pointer
+            if err := json.Unmarshal(body, &deviceZC); err != nil { // Parse []byte to go struct pointer
                 log.Println("mDNS Can not unmarshal zeroconf JSON")
             }
 
@@ -222,11 +249,110 @@ func mDnsDiscoverDevicesAsync(searchTime time.Duration) []mDNSSpotifyDevice {
     return discoveredDevices
 }
 
+// To "wake" a device and make it castable again via the WebAPI,
+// we have to re-login to it. This happens via us (the casting device)
+// sending a special login-blob to the addUser zeroconf API with which
+// the casted-to device can then login itself to our Spotify account
+func mDNSWakeDevice(device mDNSSpotifyDevice, dh *dh.DiffieHellman, userName string) error {
+    devicePublicKey, err := base64.StdEncoding.DecodeString(device.ZeroConfInfo.PublicKey)
+    if err != nil {
+        log.Fatalf("Failed to decode devices base64 publickey: %v\n", err)
+    }
+    dh.Exchange(devicePublicKey)
+    sharedSecret := dh.SharedSecretBytes()
+    fmt.Printf("Did DH exchange, calculated shared secret: %v\n", base64.StdEncoding.EncodeToString(sharedSecret))
+
+    // Begin attempt to construct a valid "blob"
+    baseKey := func() []byte { sum := sha1.Sum(sharedSecret); return sum[:16] }()
+    mac := hmac.New(sha1.New, baseKey)
+    mac.Write([]byte("checksum"))
+
+    checksumKey := mac.Sum(nil)
+    fmt.Printf("checksumKey: %v\n", checksumKey)
+
+    mac.Reset()
+    mac.Write([]byte("encryption"))
+    encryptionKey := func() []byte { sum := mac.Sum(nil); return sum[:16] }()
+    fmt.Printf("encryptionKey: %v\n", encryptionKey)
+
+    bc, err := aes.NewCipher(encryptionKey)
+    if err != nil {
+        log.Fatalf("failed initializing aes cihper: %w", err)
+    }
+
+    // Generate a random IV to use for encryption
+    iv := make([]byte, 16)
+    if _, err = rand.Read(iv); err != nil {
+        log.Fatalf("failed reading random data for IV: %w", err)
+    }
+
+    // Test payload, was successfully reconstructed (decrypted and verified) on the other end by librespot-go
+    //payload := []byte{1,2,3,4,5}
+    // I don't know yet what the unencrypted raw payload really has to be,
+    // looking into the callstack in go-librespot it gets passed around a bit
+    // and then base64-decoded and processed futher in: https://github.com/devgianlu/go-librespot/blob/master/ap/ap.go#L136
+    // This means it (the payload) for sure has to be base64-encoded bytes
+    // let's just try sending an access token lul
+    payload := make([]byte, base64.StdEncoding.EncodedLen(len([]byte(authorizationCode))))
+    base64.StdEncoding.Encode(payload, []byte(authorizationCode))
+
+    encrypted := make([]byte, len(payload))
+    cipher.NewCTR(bc, iv).XORKeyStream(encrypted, payload)
+
+    // Now we have:
+    // - iv
+    // - encrypted
+    // time to calculate the checksum:
+
+    mac = hmac.New(sha1.New, checksumKey)
+    mac.Write(encrypted)
+    checksum := mac.Sum(nil)
+
+    blobStr := base64.StdEncoding.EncodeToString(append(iv, append(encrypted, checksum...)...))
+
+    fmt.Printf("BLOB IS READY:\n")
+    fmt.Printf(" iv:       %v\n", iv)
+    fmt.Printf(" payload:  %v\n", encrypted)
+    fmt.Printf(" checksum: %v\n", checksum)
+    fmt.Printf("BLOBSTR:   %v\n", blobStr)
+
+    data := url.Values{}
+    data.Set("action", "addUser")
+    data.Set("userName", *userIdPtr)
+    data.Set("tokenType", "default")
+    data.Set("clientKey", base64.StdEncoding.EncodeToString(dh.PublicKeyBytes()))
+    data.Set("deviceName", "MusikLAUT")
+    data.Set("version", "2.12.0")
+    data.Set("blob", blobStr)
+
+    req, err := http.NewRequest("POST", fmt.Sprintf("http://%v%v", device.MDNSHostname, device.ZeroConfBaseURL), strings.NewReader(data.Encode()))
+    if err != nil {
+        log.Fatal(err)
+    }
+    req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+
+    client := &http.Client{}
+    resp, err := client.Do(req)
+    if err != nil {
+        log.Fatal(err)
+    }
+    defer resp.Body.Close()
+
+    fmt.Println("Done!")
+
+    fmt.Println("response Status:", resp.Status)
+    fmt.Println("response Headers:", resp.Header)
+    body, _ := io.ReadAll(resp.Body)
+    fmt.Println("response Body:", string(body))
+
+    return nil
+}
+
 func startAuthorizeFlow(clientId string) {
     state, err := randString(16)
     if err != nil {
         log.Fatal(err)
-	}
+    }
 
     req, err := http.NewRequest("GET", "https://accounts.spotify.com/authorize", nil)
     if err != nil {
@@ -277,6 +403,7 @@ func play(trackid string, deviceid string) (err error) {
 
 func main() {
     fs := flag.NewFlagSet(os.Args[0], flag.ContinueOnError)
+    var userIdPtr       = fs.String("userId",        "", "The Spotify user accounts ID")
     var clientIdPtr     = fs.String("clientId",      "", "The Spotify application API Token Client-ID")
     var clientSecretPtr = fs.String("clientSecret",  "", "The Spotify application API Token Client-Secret")
     var trackIdPtr      = fs.String("trackId",       "", "The Spotify trackid to play")
@@ -303,7 +430,13 @@ func main() {
     }
 
     fmt.Println("Starting")
-    mDnsDiscoverDevicesAsync(5 * time.Second)
+    dh, err := dh.NewDiffieHellman()
+    if err != nil {
+        log.Fatalf("failed initializing diffiehellman: %w", err)
+    }
+    fmt.Printf("Generated DH public key: %v\n", base64.StdEncoding.EncodeToString(dh.PublicKeyBytes()))
+
+    mDNSDevices := mDnsDiscoverDevicesAsync(5 * time.Second)
 
     fmt.Println("Login & API-based connections")
 
@@ -326,7 +459,6 @@ func main() {
     fmt.Println(authorizationCode)
 
     data := url.Values{}
-    //data.Set("grant_type", "authorization_code")
     data.Set("grant_type", "authorization_code")
     data.Set("code", authorizationCode)
     data.Set("redirect_uri", "http://127.0.0.1:1235/redirect")
@@ -356,7 +488,7 @@ func main() {
     // curl --request GET --url https://api.spotify.com/v1/me/player/devices --header "Authorization: Bearer $TOKEN"
 
     var result TokenResponse
-    if err := json.Unmarshal(body, &result); err != nil {   // Parse []byte to go struct pointer
+    if err := json.Unmarshal(body, &result); err != nil { // Parse []byte to go struct pointer
         fmt.Println("Can not unmarshal JSON")
     }
 
@@ -379,21 +511,28 @@ func main() {
     fmt.Println("response Body:", string(body))
 
     var resultDevices DevicesResponse
-    if err := json.Unmarshal(body, &resultDevices); err != nil {   // Parse []byte to go struct pointer
+    if err := json.Unmarshal(body, &resultDevices); err != nil { // Parse []byte to go struct pointer
         fmt.Println("Can not unmarshal JSON")
     }
 
     fmt.Printf("%+v\n", resultDevices.Devices)
 
     var deviceId string
-    for _, device := range(resultDevices.Devices) {
+    for _, device := range resultDevices.Devices {
         if device.Name == *deviceNamePtr {
             deviceId = device.Id
             break
         }
     }
     if deviceId == "" {
-        log.Fatalf("Spotify device with the name '%v' could not be found (offline?)", *deviceNamePtr)
+        log.Printf("Spotify device with the name '%v' could not be found (offline?)\n", *deviceNamePtr)
+
+        for _, device := range mDNSDevices {
+            if *deviceNamePtr == device.ZeroConfInfo.RemoteName {
+                fmt.Printf("Spotify device '%v' was found via mDNS/zeroconf though, attempting to zeroconf wake it\n", *deviceNamePtr)
+                mDNSWakeDevice(device, dh, *userIdPtr)
+            }
+        }
     }
 
     // Get current playback status (e.g. currently active device)
@@ -413,7 +552,7 @@ func main() {
     fmt.Println("response Body:", string(body))
 
     var resultPlayback PlaybackStateResponse
-    if err := json.Unmarshal(body, &resultPlayback); err != nil {   // Parse []byte to go struct pointer
+    if err := json.Unmarshal(body, &resultPlayback); err != nil { // Parse []byte to go struct pointer
         fmt.Println("Can not unmarshal JSON")
     }
 
