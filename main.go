@@ -1,40 +1,43 @@
 package main
 
 import (
-    "bytes"
-    "context"
-    "crypto/aes"
-    "crypto/cipher"
-    "crypto/hmac"
-    "crypto/rand"
-    "crypto/sha1"
-    "encoding/base64"
-    "encoding/json/jsontext"
-    json "encoding/json/v2"
-    "errors"
-    "flag"
-    "fmt"
-    "io"
-    "log"
-    "net"
-    "net/http"
-    "net/url"
-    "os"
-    "strings"
-    "sync"
-    "time"
+	"bytes"
+	"context"
+	"crypto/aes"
+	"crypto/cipher"
+	"crypto/hmac"
+	"crypto/rand"
+	"crypto/sha1"
+	"encoding/base64"
+	"encoding/binary"
+	"encoding/json/jsontext"
+	json "encoding/json/v2"
+	"errors"
+	"flag"
+	"fmt"
+	"io"
+	"log"
+	"net"
+	"net/http"
+	"net/url"
+	"os"
+	"strings"
+	"sync"
+	"time"
 
-    // Internal imports
-    "MusikLAUT/dh"
+	"golang.org/x/crypto/pbkdf2"
 
-    // Configuration
-    "github.com/peterbourgon/ff/v3"
+	// Internal imports
+	"MusikLAUT/dh"
 
-    // Launching the OS-native browser with the login-link
-    "github.com/pkg/browser"
+	// Configuration
+	"github.com/peterbourgon/ff/v3"
 
-    // For mDNS-based device discovery
-    "github.com/grandcat/zeroconf"
+	// Launching the OS-native browser with the login-link
+	"github.com/pkg/browser"
+
+	// For mDNS-based device discovery
+	"github.com/grandcat/zeroconf"
 )
 
 var scopes = []string{"user-read-playback-state", "user-modify-playback-state"}
@@ -167,19 +170,6 @@ type apResolveResponse struct {
     Spclient    []string `json:"spclient,omitempty"`
 }
 
-func obtainReusableCredentialsBlob() error {
-    // Turns out doing this the real way is far too complicated.
-    // If I implement this, it's going to be by starting librespot
-    // or librespot-go as a separate process and waiting for the
-    // credentials blob to show up in their state/config files
-
-    // See librespot-go source for how it would be done (connect to ap, speak protobuf via socket):
-    // https://github.com/devgianlu/go-librespot/blob/master/session/session.go#L34
-    // https://github.com/devgianlu/go-librespot/blob/master/ap/ap.go#L120
-    // https://github.com/devgianlu/go-librespot/blob/master/ap/ap.go#L550
-    return nil
-}
-
 func mDnsDiscoverDevicesAsync(searchTime time.Duration) []mDNSSpotifyDevice {
     var discoveredDevices []mDNSSpotifyDevice
     fmt.Println("mDNS discovery")
@@ -249,12 +239,89 @@ func mDnsDiscoverDevicesAsync(searchTime time.Duration) []mDNSSpotifyDevice {
     return discoveredDevices
 }
 
-// To "wake" a device and make it castable again via the WebAPI,
-// we have to re-login to it. This happens via us (the casting device)
-// sending a special login-blob to the addUser zeroconf API with which
-// the casted-to device can then login itself to our Spotify account
-func mDNSWakeDevice(device mDNSSpotifyDevice, dh *dh.DiffieHellman, userName string) error {
-    devicePublicKey, err := base64.StdEncoding.DecodeString(device.ZeroConfInfo.PublicKey)
+func buildZeroconfAuthBlob(deviceId string, devicePublicKeyB64 string, userName string, dh *dh.DiffieHellman) string {
+    // Begin constructing main payload
+    var payload []byte
+    // First byte is discarded, make it anything (my phone sent 73 to go-librespot so let's use that)
+    payload = append(payload, 73)
+    // Write a uint64 to the payload, it specifies how many following bytes to discard.
+    // Using AppendUvarint transformed the 28 into a 246 and idk why yet. Just hardcode the byte 28 for now.
+    payload = binary.AppendUvarint(payload, 28)
+    //payload = append(payload, 28)
+    // Add the 28 bytes to be skipped, go-librespot and my Yamaha AVR don't seem to care if this is random/bogus data
+    payload = append(payload, []byte{42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42}...)
+    // Another byte that is discarded
+    payload = append(payload, 80)
+    // Write the authenticationType (uint64)
+    // again, having issues with not understanding AppendUvarint, do it with append for now
+    //binary.AppendUvarint(payload, 1) // 1 == "AUTHENTICATION_STORED_SPOTIFY_CREDENTIALS"
+    payload = append(payload, 1)
+    // Another byte that is discarded
+    payload = append(payload, 81)
+    // I don't know yet what the "authData" has to be, but it kind of looks like an authentication_code / OAuth token.
+    // For testing purposes we can just paste in an old authData block that was sent by a Spotify client previously and packet-captured, they are replayable
+    authData := []byte{42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42}
+    // Write a uint64 to the payload, it specifies the length of the authData block after it.
+    // again, having issues with not understanding AppendUvarint, do it with append for now
+    payload = binary.AppendUvarint(payload, uint64(len(authData)))
+    // Next is the actual authData/stored-credentials block
+    payload = append(payload, []byte(authData)...)
+
+    fmt.Printf("raw unencrypted blob payload (pre-encryption, pre-XOR, unpadded): %v\n", payload)
+
+    // Encrypt payload with deviceId + username (the first, inner encryption)
+    secret := sha1.Sum([]byte(deviceId))
+    baseKey := pbkdf2.Key(secret[:], []byte(userName), 256, 20, sha1.New)
+    key := make([]byte, 24)
+    copy(key, func() []byte { sum := sha1.Sum(baseKey); return sum[:] }())
+    binary.BigEndian.PutUint32(key[20:], 20)
+
+    fmt.Printf("AES initialization key derived from target deviceId '%v': %v\n", deviceId, key)
+
+    devidusrnameBlockCipher, err := aes.NewCipher(key)
+    if err != nil {
+        fmt.Println("failed initializing AES cipher to encrypt blob payload with targets deviceId:", err)
+    }
+
+    fmt.Printf("About to encrypt blob payload with key derived from deviceId\n")
+
+    // Pad our B64-encoded payload for AES block cipher (pkcs7 standard)
+	n := aes.BlockSize - (len(payload) % aes.BlockSize)
+	payloadPadded := make([]byte, len(payload)+n)
+	copy(payloadPadded, payload)
+	copy(payloadPadded[len(payload):], bytes.Repeat([]byte{byte(n)}, n))
+
+    // Weird offset XOR obfuscation
+    for j := 16; j < len(payloadPadded); j++ {
+        payloadPadded[j] ^= payloadPadded[j-16]
+    }
+    // The above is the copilot-suggested inverse of the below original XOR that's applied
+    // in go-librespot (the cast-to device). EDIT: it worked first try, I am shook
+    //for i := 0; i < len(payloadPadded)-16; i++ {
+    //    payloadPadded[len(payloadPadded)-i-1] ^= payloadPadded[len(payloadPadded)-i-17]
+    //}
+
+    fmt.Printf("raw unencrypted blob payload (pre-encryption, XORd, padded): %v\n", payloadPadded)
+
+    encryptedPayload := make([]byte, len(payloadPadded))
+    for i := 0; i < len(payloadPadded)-1; i += aes.BlockSize {
+        devidusrnameBlockCipher.Encrypt(encryptedPayload[i:], payloadPadded[i:])
+    }
+
+    fmt.Printf("raw once-encrypted blob payload: %v\n", encryptedPayload)
+
+    // Base64 encode inner encrypted payload
+    payloadB64 := make([]byte, base64.StdEncoding.EncodedLen(len(encryptedPayload)))
+    base64.StdEncoding.Encode(payloadB64, encryptedPayload)
+
+    // At this point, the central payload (authData) is encrypted using the
+    // users userName and the target devices deviceId and then base64-encoded
+    //
+    // The resulting base64 bytes are now encrypted again with a shared secret
+    // obtained through a DH exchange (and then once more base64-encoded)
+
+    // Do DH exchange / calculation
+    devicePublicKey, err := base64.StdEncoding.DecodeString(devicePublicKeyB64)
     if err != nil {
         log.Fatalf("Failed to decode devices base64 publickey: %v\n", err)
     }
@@ -262,8 +329,7 @@ func mDNSWakeDevice(device mDNSSpotifyDevice, dh *dh.DiffieHellman, userName str
     sharedSecret := dh.SharedSecretBytes()
     fmt.Printf("Did DH exchange, calculated shared secret: %v\n", base64.StdEncoding.EncodeToString(sharedSecret))
 
-    // Begin attempt to construct a valid "blob"
-    baseKey := func() []byte { sum := sha1.Sum(sharedSecret); return sum[:16] }()
+    baseKey = func() []byte { sum := sha1.Sum(sharedSecret); return sum[:16] }()
     mac := hmac.New(sha1.New, baseKey)
     mac.Write([]byte("checksum"))
 
@@ -275,50 +341,52 @@ func mDNSWakeDevice(device mDNSSpotifyDevice, dh *dh.DiffieHellman, userName str
     encryptionKey := func() []byte { sum := mac.Sum(nil); return sum[:16] }()
     fmt.Printf("encryptionKey: %v\n", encryptionKey)
 
-    bc, err := aes.NewCipher(encryptionKey)
+    dhexchangeCipher, err := aes.NewCipher(encryptionKey)
     if err != nil {
         log.Fatalf("failed initializing aes cihper: %w", err)
     }
 
-    // Generate a random IV to use for encryption
+    // Generate a random IV to use for outer encryption (with DH secret)
     iv := make([]byte, 16)
     if _, err = rand.Read(iv); err != nil {
         log.Fatalf("failed reading random data for IV: %w", err)
     }
 
-    // Test payload, was successfully reconstructed (decrypted and verified) on the other end by librespot-go
-    //payload := []byte{1,2,3,4,5}
-    // I don't know yet what the unencrypted raw payload really has to be,
-    // looking into the callstack in go-librespot it gets passed around a bit
-    // and then base64-decoded and processed futher in: https://github.com/devgianlu/go-librespot/blob/master/ap/ap.go#L136
-    // This means it (the payload) for sure has to be base64-encoded bytes
-    // let's just try sending an access token lul
-    payload := make([]byte, base64.StdEncoding.EncodedLen(len([]byte(authorizationCode))))
-    base64.StdEncoding.Encode(payload, []byte(authorizationCode))
-
-    encrypted := make([]byte, len(payload))
-    cipher.NewCTR(bc, iv).XORKeyStream(encrypted, payload)
+    // Perform outer encryption with DH secret key
+    dhEncrypted := make([]byte, len(payloadB64))
+    cipher.NewCTR(dhexchangeCipher, iv).XORKeyStream(dhEncrypted, payloadB64)
 
     // Now we have:
     // - iv
-    // - encrypted
+    // - twice-encrypted payload
     // time to calculate the checksum:
 
     mac = hmac.New(sha1.New, checksumKey)
-    mac.Write(encrypted)
+    mac.Write(dhEncrypted)
     checksum := mac.Sum(nil)
 
-    blobStr := base64.StdEncoding.EncodeToString(append(iv, append(encrypted, checksum...)...))
+    // Join [iv + payload + checksum] and base64-encode everything, that's the final blob
+    blobStr := base64.StdEncoding.EncodeToString(append(iv, append(dhEncrypted, checksum...)...))
 
     fmt.Printf("BLOB IS READY:\n")
     fmt.Printf(" iv:       %v\n", iv)
-    fmt.Printf(" payload:  %v\n", encrypted)
+    fmt.Printf(" payload:  %v\n", dhEncrypted)
     fmt.Printf(" checksum: %v\n", checksum)
     fmt.Printf("BLOBSTR:   %v\n", blobStr)
 
+    return blobStr
+}
+
+// To "wake" a device and make it castable again via the WebAPI,
+// we have to re-login to it. This happens via us (the casting device)
+// sending a special login-blob to the addUser zeroconf API with which
+// the casted-to device can then login itself to our Spotify account
+func mDNSWakeDevice(device mDNSSpotifyDevice, dh *dh.DiffieHellman, userName string) error {
+    blobStr := buildZeroconfAuthBlob(device.ZeroConfInfo.DeviceId, device.ZeroConfInfo.PublicKey, userName, dh)
+
     data := url.Values{}
     data.Set("action", "addUser")
-    data.Set("userName", *userIdPtr)
+    data.Set("userName", userName)
     data.Set("tokenType", "default")
     data.Set("clientKey", base64.StdEncoding.EncodeToString(dh.PublicKeyBytes()))
     data.Set("deviceName", "MusikLAUT")
