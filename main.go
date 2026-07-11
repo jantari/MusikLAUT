@@ -24,6 +24,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"golang.org/x/term"
 
 	"golang.org/x/crypto/pbkdf2"
 
@@ -44,10 +45,13 @@ var scopes = []string{"user-read-playback-state", "user-modify-playback-state", 
 
 var authorizationCode = ""
 var accessToken = ""
+var dhState *dh.DiffieHellman
 
 var TrackIds = map[string]string{
     "Ophelia":     "spotify:track:53iuhJlwXhSER5J2IYYv1W",
+    "Opalite":     "spotify:track:3yWuTOYDztXjZxdE2cIRUa",
     "Koerperteil": "spotify:track:3wECJLFkS6cGvdyVOmGFme",
+    "GuteLaune":   "spotify:track:7fapAlfgJf6EzlviBqJb4f",
 }
 
 type TokenResponse struct {
@@ -132,22 +136,34 @@ func randString(nByte int) (string, error) {
     return base64.RawURLEncoding.EncodeToString(b), nil
 }
 
-func startCallbackListenerAsync(wg *sync.WaitGroup) *http.Server {
+type SpotifyOAuth struct {
+    CallbackEventCh chan string
+}
+
+func (h *SpotifyOAuth) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+    fmt.Printf("Got Spotify auth callback: %v\n", r.URL.Query())
+    fmt.Println("Headers:")
+    for k, v := range r.Header {
+        fmt.Printf("  %v: %v\n", k, v)
+    }
+
+    if r.URL.Query().Has("code") {
+        h.CallbackEventCh <- r.URL.Query().Get("code")
+        w.Write([]byte("Looks good!"))
+    } else {
+        http.Error(w, "Something went wrong, no 'code' in URL", http.StatusExpectationFailed)
+    }
+}
+
+
+func startCallbackListenerAsync(wg *sync.WaitGroup, authURL string, ch chan string) *http.Server {
     srv := &http.Server{Addr: ":1235"}
 
-    http.HandleFunc("GET /redirect", func(w http.ResponseWriter, r *http.Request) {
-        fmt.Printf("Got Spotify auth callback: %v\n", r.URL.Query())
-        fmt.Println("Headers:")
-        for k, v := range r.Header {
-            fmt.Printf("  %v: %v\n", k, v)
-        }
+    redirectHandler := &SpotifyOAuth{CallbackEventCh: ch}
+    http.Handle("GET /redirect", redirectHandler)
 
-        if r.URL.Query().Has("code") {
-            authorizationCode = r.URL.Query().Get("code")
-            w.Write([]byte("Looks good!"))
-        } else {
-            w.Write([]byte("Something probably went wrong :("))
-        }
+    http.HandleFunc("GET /", func(w http.ResponseWriter, r *http.Request) {
+        http.Redirect(w, r, authURL, http.StatusTemporaryRedirect)
     })
 
     go func() {
@@ -241,28 +257,33 @@ func mDnsDiscoverDevicesAsync(searchTime time.Duration) []mDNSSpotifyDevice {
     return discoveredDevices
 }
 
-func buildZeroconfAuthBlob(deviceId string, devicePublicKeyB64 string, userName string, dh *dh.DiffieHellman) string {
+func buildZeroconfAuthBlob(deviceId string, devicePublicKeyB64 string, userName string, authBlobFile string) string {
+    // I don't know yet what the "authData" has to be, but it kind of looks like an authentication_code / OAuth token.
+    // For testing purposes we can just paste in an old authData block that was sent by a Spotify client previously and packet-captured, they are replayable
+    b64AuthData, err := os.ReadFile(authBlobFile)
+    if err != nil {
+        log.Fatalf("buildZeroconfAuthBlob(): could not read authBlob file %v", err)
+    }
+    authData := make([]byte, base64.StdEncoding.EncodedLen(len(b64AuthData)))
+    base64.StdEncoding.Encode(authData, b64AuthData)
+    if err != nil {
+        log.Fatalf("buildZeroconfAuthBlob(): could not decode authBlob base64 %v", err)
+    }
+
     // Begin constructing main payload
     var payload []byte
     // First byte is discarded, make it anything (my phone sent 73 to go-librespot so let's use that)
     payload = append(payload, 73)
-    // Write a uint64 to the payload, it specifies how many following bytes to discard.
-    // Using AppendUvarint transformed the 28 into a 246 and idk why yet. Just hardcode the byte 28 for now.
+    // Write a uint64 to the payload, it specifies how many following bytes to discard (at least to go-librespot)
     payload = binary.AppendUvarint(payload, 28)
-    //payload = append(payload, 28)
     // Add the 28 bytes to be skipped, go-librespot and my Yamaha AVR don't seem to care if this is random/bogus data
     payload = append(payload, []byte{42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42}...)
     // Another byte that is discarded
     payload = append(payload, 80)
     // Write the authenticationType (uint64)
-    // again, having issues with not understanding AppendUvarint, do it with append for now
-    //binary.AppendUvarint(payload, 1) // 1 == "AUTHENTICATION_STORED_SPOTIFY_CREDENTIALS"
-    payload = append(payload, 1)
+    payload = binary.AppendUvarint(payload, 1) // 1 == "AUTHENTICATION_STORED_SPOTIFY_CREDENTIALS"
     // Another byte that is discarded
     payload = append(payload, 81)
-    // I don't know yet what the "authData" has to be, but it kind of looks like an authentication_code / OAuth token.
-    // For testing purposes we can just paste in an old authData block that was sent by a Spotify client previously and packet-captured, they are replayable
-    authData := []byte{42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42}
     // Write a uint64 to the payload, it specifies the length of the authData block after it.
     // again, having issues with not understanding AppendUvarint, do it with append for now
     payload = binary.AppendUvarint(payload, uint64(len(authData)))
@@ -288,10 +309,10 @@ func buildZeroconfAuthBlob(deviceId string, devicePublicKeyB64 string, userName 
     fmt.Printf("About to encrypt blob payload with key derived from deviceId\n")
 
     // Pad our B64-encoded payload for AES block cipher (pkcs7 standard)
-	n := aes.BlockSize - (len(payload) % aes.BlockSize)
-	payloadPadded := make([]byte, len(payload)+n)
-	copy(payloadPadded, payload)
-	copy(payloadPadded[len(payload):], bytes.Repeat([]byte{byte(n)}, n))
+    n := aes.BlockSize - (len(payload) % aes.BlockSize)
+    payloadPadded := make([]byte, len(payload)+n)
+    copy(payloadPadded, payload)
+    copy(payloadPadded[len(payload):], bytes.Repeat([]byte{byte(n)}, n))
 
     // Weird offset XOR obfuscation
     for j := 16; j < len(payloadPadded); j++ {
@@ -327,8 +348,8 @@ func buildZeroconfAuthBlob(deviceId string, devicePublicKeyB64 string, userName 
     if err != nil {
         log.Fatalf("Failed to decode devices base64 publickey: %v\n", err)
     }
-    dh.Exchange(devicePublicKey)
-    sharedSecret := dh.SharedSecretBytes()
+    dhState.Exchange(devicePublicKey)
+    sharedSecret := dhState.SharedSecretBytes()
     fmt.Printf("Did DH exchange, calculated shared secret: %v\n", base64.StdEncoding.EncodeToString(sharedSecret))
 
     baseKey = func() []byte { sum := sha1.Sum(sharedSecret); return sum[:16] }()
@@ -383,42 +404,47 @@ func buildZeroconfAuthBlob(deviceId string, devicePublicKeyB64 string, userName 
 // we have to re-login to it. This happens via us (the casting device)
 // sending a special login-blob to the addUser zeroconf API with which
 // the casted-to device can then login itself to our Spotify account
-func mDNSWakeDevice(device mDNSSpotifyDevice, dh *dh.DiffieHellman, userName string) error {
-    blobStr := buildZeroconfAuthBlob(device.ZeroConfInfo.DeviceId, device.ZeroConfInfo.PublicKey, userName, dh)
+func mDNSWakeDevice(device mDNSSpotifyDevice, userName string, authBlobFile string) error {
+    blobStr := buildZeroconfAuthBlob(device.ZeroConfInfo.DeviceId, device.ZeroConfInfo.PublicKey, userName, authBlobFile)
 
     data := url.Values{}
     data.Set("action", "addUser")
     data.Set("userName", userName)
     data.Set("tokenType", "default")
-    data.Set("clientKey", base64.StdEncoding.EncodeToString(dh.PublicKeyBytes()))
+    data.Set("clientKey", base64.StdEncoding.EncodeToString(dhState.PublicKeyBytes()))
     data.Set("deviceName", "MusikLAUT")
     data.Set("version", "2.12.0")
     data.Set("blob", blobStr)
 
     req, err := http.NewRequest("POST", fmt.Sprintf("http://%v%v", device.IPv4Addresses[0], device.ZeroConfBaseURL), strings.NewReader(data.Encode()))
     if err != nil {
-        log.Fatal(err)
+        return fmt.Errorf("could not wake device, preparing addUser request failed: %v", err)
     }
     req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 
     client := &http.Client{}
     resp, err := client.Do(req)
     if err != nil {
-        log.Fatal(err)
+        return fmt.Errorf("could not wake device, addUser request failed: %v", err)
     }
     defer resp.Body.Close()
 
-    fmt.Println("Done!")
+    fmt.Println("addUser response Status:", resp.Status)
+    fmt.Println("addUser response Headers:", resp.Header)
+    body, err := io.ReadAll(resp.Body)
+    if err != nil {
+        return fmt.Errorf("could not wake device, reading addUser response failed: %v", err)
+    }
+    fmt.Println("addUser response Body:", string(body))
 
-    fmt.Println("response Status:", resp.Status)
-    fmt.Println("response Headers:", resp.Header)
-    body, _ := io.ReadAll(resp.Body)
-    fmt.Println("response Body:", string(body))
-
-    return nil
+    if resp.StatusCode >= 200 && resp.StatusCode < 300 {
+        return nil
+    } else {
+        return fmt.Errorf("could not wake device, unexpected addUser return code: %v", resp.Status)
+    }
 }
 
-func startAuthorizeFlow(clientId string) {
+func startAuthorizeFlow(clientId string) string {
     state, err := randString(16)
     if err != nil {
         log.Fatal(err)
@@ -438,16 +464,14 @@ func startAuthorizeFlow(clientId string) {
 
     req.URL.RawQuery = q.Encode()
 
-    fmt.Println(req.URL.String())
-
-    // Open the browser for user-interactive authorization
-    browser.OpenURL(req.URL.String())
+    return req.URL.String()
 }
 
 func play(trackid string, deviceid string) (err error) {
     var jsonString = fmt.Sprintf(`{"uris":["%v"],"position_ms":0}`, trackid)
     var jsonBody = []byte(jsonString)
 
+    log.Printf("Making API call to play '%v' on '%v'...\n", trackid, deviceid)
     req, err := http.NewRequest("PUT", "https://api.spotify.com/v1/me/player/play", bytes.NewReader(jsonBody))
     q := req.URL.Query()
     q.Set("device_id", deviceid)
@@ -465,20 +489,77 @@ func play(trackid string, deviceid string) (err error) {
 
     fmt.Println("response Status:", resp.Status)
     fmt.Println("response Headers:", resp.Header)
-    body, _ := io.ReadAll(resp.Body)
+    body, err := io.ReadAll(resp.Body)
+    if err != nil {
+        return fmt.Errorf("could not play song, reading API response failed: %v", err)
+    }
     fmt.Println("response Body:", string(body))
 
     return nil
 }
 
+func getDeviceIdFromName(userId string, deviceName string, apiAccessToken string, authBlobFile string) (string, error) {
+    // Make first relevant Spotify API call - GET AVAILABLE PLAYBACK DEVICES (CONNECT, CAST-TO)
+    req, err := http.NewRequest("GET", "https://api.spotify.com/v1/me/player/devices", nil)
+    req.Header.Set("Authorization", fmt.Sprintf("Bearer %v", apiAccessToken))
+    client := &http.Client{}
+    resp, err := client.Do(req)
+    if err != nil {
+        log.Fatal(err)
+    }
+    defer resp.Body.Close()
+
+    fmt.Println("response Status:", resp.Status)
+    fmt.Println("response Headers:", resp.Header)
+    body, err := io.ReadAll(resp.Body)
+    if err != nil {
+        return "", fmt.Errorf("could not get devices, reading API response failed: %v", err)
+    }
+    fmt.Println("response Body:", string(body))
+
+    var resultDevices DevicesResponse
+    if err := json.Unmarshal(body, &resultDevices); err != nil { // Parse []byte to go struct pointer
+        fmt.Println("Can not unmarshal JSON")
+    }
+
+    fmt.Printf("%+v\n", resultDevices.Devices)
+
+    var deviceId string
+    for _, device := range resultDevices.Devices {
+        if device.Name == deviceName {
+            deviceId = device.Id
+            break
+        }
+    }
+    if deviceId == "" {
+        log.Printf("Spotify device with the name '%v' could not be found (offline?)\n", deviceName)
+        log.Println("Attempting to find sleeping/logged-out devices via mDNS/DNS-SD/zeroconf...")
+        mDNSDevices := mDnsDiscoverDevicesAsync(5 * time.Second)
+
+        for _, device := range mDNSDevices {
+            if deviceName == device.ZeroConfInfo.RemoteName {
+                log.Printf("Spotify device '%v' was found via mDNS/zeroconf though, attempting to zeroconf wake it up\n", deviceName)
+                err = mDNSWakeDevice(device, userId, authBlobFile)
+                if err != nil {
+                    return "", fmt.Errorf("mDNSWakeDevice() failed: %v", err)
+                }
+                return device.ZeroConfInfo.DeviceId, nil
+            }
+        }
+
+        return "", fmt.Errorf("could not find any device with the name '%v'", deviceName)
+    } else {
+        return deviceId, nil
+    }
+}
+
 func main() {
     fs := flag.NewFlagSet(os.Args[0], flag.ContinueOnError)
-    var userIdPtr           = fs.String("userId",        "", "The Spotify user accounts ID")
-    var clientIdPtr         = fs.String("clientId",      "", "The Spotify application API Token Client-ID")
-    var clientSecretPtr     = fs.String("clientSecret",  "", "The Spotify application API Token Client-Secret")
-    var trackIdPtr          = fs.String("trackId",       "", "The Spotify trackid to play")
-    var deviceNamePtr       = fs.String("deviceName",    "", "The name of the device to play it on")
-    var callbackWaitTimePtr = fs.Int("callbackWait",     8,  "The seconds to wait for the authorization redirect/callback to our app")
+    var userIdPtr       = fs.String("userId",       "", "The Spotify user accounts ID")
+    var clientIdPtr     = fs.String("clientId",     "", "The Spotify application API Token Client-ID")
+    var clientSecretPtr = fs.String("clientSecret", "", "The Spotify application API Token Client-Secret")
+    var deviceNamePtr   = fs.String("deviceName",   "", "The name of the device to play it on")
+    var authBlobFilePtr = fs.String("authBlobFile", "./authData.txt", "A file with previously captured, base64-encoded 'authData'")
 
     // Ingest configuration flags.
     // Commandline arguments > Environment variables
@@ -501,29 +582,35 @@ func main() {
     }
 
     fmt.Println("Starting")
-    dh, err := dh.NewDiffieHellman()
+    dhState, err = dh.NewDiffieHellman()
     if err != nil {
         log.Fatalf("failed initializing diffiehellman: %w", err)
     }
-    fmt.Printf("Generated DH public key: %v\n", base64.StdEncoding.EncodeToString(dh.PublicKeyBytes()))
-
-    mDNSDevices := mDnsDiscoverDevicesAsync(5 * time.Second)
+    fmt.Printf("Generated DH public key: %v\n", base64.StdEncoding.EncodeToString(dhState.PublicKeyBytes()))
 
     fmt.Println("Login & API-based connections")
 
     httpServerExitDone := &sync.WaitGroup{}
     httpServerExitDone.Add(1)
 
-    srv := startCallbackListenerAsync(httpServerExitDone)
+    callbackChan := make(chan string)
+    authURL := startAuthorizeFlow(*clientIdPtr)
+    srv := startCallbackListenerAsync(httpServerExitDone, authURL, callbackChan)
 
-    startAuthorizeFlow(*clientIdPtr)
+    // Open the browser for user-interactive authorization
+    fmt.Println("If a browser does not open automatically, visit the above URL *or* this computer on HTTP port :1235/ (which serves a redirect)")
+    browser.OpenURL(authURL)
 
-    // TODO don't just wait a random time, kill the server + continue when the URL handler is called
+    // Wait for a callback - this channel read will block
     fmt.Println("Waiting for callback ...")
-    time.Sleep(time.Duration(*callbackWaitTimePtr) * time.Second)
+    authorizationCode, ok := <- callbackChan
+    if !ok {
+        log.Fatal("callback channel was unexpectedly closed")
+    }
 
+    close(callbackChan)
     if err := srv.Shutdown(context.TODO()); err != nil {
-        panic(err) // failure/timeout shutting down the server gracefully
+        log.Fatalf("Could not stop callback listener: %v", err) // failure/timeout shutting down the server gracefully
     }
 
     fmt.Println("Done!")
@@ -552,7 +639,10 @@ func main() {
 
     fmt.Println("response Status:", resp.Status)
     fmt.Println("response Headers:", resp.Header)
-    body, _ := io.ReadAll(resp.Body)
+    body, err := io.ReadAll(resp.Body)
+    if err != nil {
+        log.Fatalf("could not obtain access token, reading API response failed: %v", err)
+    }
     fmt.Println("response Body:", string(body))
 
     // Mit dem access_token aus der response kann man dann API requests machen, z.B.:
@@ -566,44 +656,10 @@ func main() {
     fmt.Printf("Got access token: %v\n", result.AccessToken)
     accessToken = result.AccessToken
 
-    // Make first relevant Spotify API call - GET AVAILABLE PLAYBACK DEVICES (CONNECT, CAST-TO)
-    req, err = http.NewRequest("GET", "https://api.spotify.com/v1/me/player/devices", nil)
-    req.Header.Set("Authorization", fmt.Sprintf("Bearer %v", result.AccessToken))
-    client = &http.Client{}
-    resp, err = client.Do(req)
+    // GET DEVICEID FROM NAME HERE
+    deviceId, err := getDeviceIdFromName(*userIdPtr, *deviceNamePtr, result.AccessToken, *authBlobFilePtr)
     if err != nil {
-        log.Fatal(err)
-    }
-    defer resp.Body.Close()
-
-    fmt.Println("response Status:", resp.Status)
-    fmt.Println("response Headers:", resp.Header)
-    body, _ = io.ReadAll(resp.Body)
-    fmt.Println("response Body:", string(body))
-
-    var resultDevices DevicesResponse
-    if err := json.Unmarshal(body, &resultDevices); err != nil { // Parse []byte to go struct pointer
-        fmt.Println("Can not unmarshal JSON")
-    }
-
-    fmt.Printf("%+v\n", resultDevices.Devices)
-
-    var deviceId string
-    for _, device := range resultDevices.Devices {
-        if device.Name == *deviceNamePtr {
-            deviceId = device.Id
-            break
-        }
-    }
-    if deviceId == "" {
-        log.Printf("Spotify device with the name '%v' could not be found (offline?)\n", *deviceNamePtr)
-
-        for _, device := range mDNSDevices {
-            if *deviceNamePtr == device.ZeroConfInfo.RemoteName {
-                fmt.Printf("Spotify device '%v' was found via mDNS/zeroconf though, attempting to zeroconf wake it\n", *deviceNamePtr)
-                mDNSWakeDevice(device, dh, *userIdPtr)
-            }
-        }
+        log.Fatalf("getDeviceIdFromName() failed: %v", err)
     }
 
     // Get current playback status (e.g. currently active device)
@@ -635,7 +691,51 @@ func main() {
 
     time.Sleep(1 * time.Second)
 
-    fmt.Println("Switching playback...")
-    play(*trackIdPtr, deviceId)
+    // Ready for input loop
+    //
+    // switch stdin into 'raw' mode to be able to read single keypresses (like C# Console.ReadKey())
+    keypressChannel := make(chan string)
+
+    oldState, err := term.MakeRaw(int(os.Stdin.Fd()))
+    if err != nil {
+        fmt.Println(err)
+        return
+    }
+    defer term.Restore(int(os.Stdin.Fd()), oldState)
+
+    // Collect and push keypresses to a channel
+    go func(ch chan string) {
+        var b []byte = make([]byte, 1)
+        for {
+            os.Stdin.Read(b)
+            keypressChannel <- string(b)
+        }
+    }(keypressChannel)
+
+    // Endlessly process the keypresses from the channel
+    fmt.Println("Awaiting input(s)...")
+    input:
+    for {
+        select {
+            case stdin, _ := <-keypressChannel:
+                fmt.Printf("Key pressed: '%v' (string->[]byte)\n", []byte(stdin))
+                switch stdin {
+                    case "z":
+                        play(TrackIds["Opalite"], deviceId)
+                    case "x":
+                        play(TrackIds["Ophelia"], deviceId)
+                    case "c":
+                        play(TrackIds["Koerperteil"], deviceId)
+                    case "v":
+                        play(TrackIds["GuteLaune"], deviceId)
+
+                    case "\x1b":
+                        fmt.Printf("pressed ESC\n")
+                        break input
+                }
+            default:
+        }
+        time.Sleep(time.Millisecond * 150)
+    }
 }
 

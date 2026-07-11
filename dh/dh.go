@@ -3,7 +3,7 @@ package dh
 // This is a full-on copy-paste from go-librespot
 
 import (
-    "encoding/base64"
+	"encoding/base64"
 	"crypto/rand"
 	"fmt"
 	"math/big"
@@ -40,15 +40,15 @@ func NewDiffieHellman() (dh *DiffieHellman, err error) {
 	dh = &DiffieHellman{}
 	dh.privateKey = new(big.Int).SetBytes(privateKeyData)
 	dh.publicKey = new(big.Int).Exp(dhGenerator, dh.privateKey, dhPrime)
-    fmt.Printf("JANDEBUG dh.NewDiffieHellman(): generated private and public key pair:\n")
-    fmt.Printf("  Private: %v\n  Public: %v\n", base64.StdEncoding.EncodeToString(dh.privateKey.Bytes()), base64.StdEncoding.EncodeToString(dh.publicKey.Bytes()))
+	fmt.Printf("JANDEBUG dh.NewDiffieHellman(): generated private and public key pair:\n")
+	fmt.Printf("  Private: %v\n  Public: %v\n", base64.StdEncoding.EncodeToString(dh.privateKey.Bytes()), base64.StdEncoding.EncodeToString(dh.publicKey.Bytes()))
 	return dh, nil
 }
 
 func (dh *DiffieHellman) Exchange(remoteKeyBytes []byte) []byte {
 	remoteKey := new(big.Int).SetBytes(remoteKeyBytes)
 	dh.sharedSecret = new(big.Int).Exp(remoteKey, dh.privateKey, dhPrime).Bytes()
-    fmt.Printf("JANDEBUG dh.Exchange(): sharedSecret exchanged/constructed: %v\n", base64.StdEncoding.EncodeToString(dh.sharedSecret))
+	fmt.Printf("JANDEBUG dh.Exchange(): sharedSecret exchanged/constructed: %v\n", base64.StdEncoding.EncodeToString(dh.sharedSecret))
 	return dh.sharedSecret
 }
 
