@@ -40,7 +40,7 @@ import (
 	"github.com/grandcat/zeroconf"
 )
 
-var scopes = []string{"user-read-playback-state", "user-modify-playback-state"}
+var scopes = []string{"user-read-playback-state", "user-modify-playback-state", "streaming"} // Not sure at all if "streaming" is required
 
 var authorizationCode = ""
 var accessToken = ""
@@ -189,9 +189,11 @@ func mDnsDiscoverDevicesAsync(searchTime time.Duration) []mDNSSpotifyDevice {
                     zeroConfPath = strings.TrimPrefix(val, "CPath=")
                 }
             }
-            fmt.Printf("Spotify Connect device: %v, query http://%v:%v%v?action=getInfo\n", entry.Instance, entry.HostName, entry.Port, zeroConfPath)
+            fmt.Printf("Spotify Connect device: %v, query http://%v:%v%v?action=getInfo\n", entry.Instance, entry.AddrIPv4[0], entry.Port, zeroConfPath)
 
-            req, err := http.NewRequest("GET", fmt.Sprintf("http://%v:%v%v?action=getInfo", entry.HostName, entry.Port, zeroConfPath), nil)
+            fmt.Printf("ALL-DATA: %+v\n", entry)
+
+            req, err := http.NewRequest("GET", fmt.Sprintf("http://%v:%v%v?action=getInfo", entry.AddrIPv4[0], entry.Port, zeroConfPath), nil)
             if err != nil {
                 log.Fatal(err)
             }
@@ -393,7 +395,7 @@ func mDNSWakeDevice(device mDNSSpotifyDevice, dh *dh.DiffieHellman, userName str
     data.Set("version", "2.12.0")
     data.Set("blob", blobStr)
 
-    req, err := http.NewRequest("POST", fmt.Sprintf("http://%v%v", device.MDNSHostname, device.ZeroConfBaseURL), strings.NewReader(data.Encode()))
+    req, err := http.NewRequest("POST", fmt.Sprintf("http://%v%v", device.IPv4Addresses[0], device.ZeroConfBaseURL), strings.NewReader(data.Encode()))
     if err != nil {
         log.Fatal(err)
     }
@@ -471,11 +473,12 @@ func play(trackid string, deviceid string) (err error) {
 
 func main() {
     fs := flag.NewFlagSet(os.Args[0], flag.ContinueOnError)
-    var userIdPtr       = fs.String("userId",        "", "The Spotify user accounts ID")
-    var clientIdPtr     = fs.String("clientId",      "", "The Spotify application API Token Client-ID")
-    var clientSecretPtr = fs.String("clientSecret",  "", "The Spotify application API Token Client-Secret")
-    var trackIdPtr      = fs.String("trackId",       "", "The Spotify trackid to play")
-    var deviceNamePtr   = fs.String("deviceName",    "", "The name of the device to play it on")
+    var userIdPtr           = fs.String("userId",        "", "The Spotify user accounts ID")
+    var clientIdPtr         = fs.String("clientId",      "", "The Spotify application API Token Client-ID")
+    var clientSecretPtr     = fs.String("clientSecret",  "", "The Spotify application API Token Client-Secret")
+    var trackIdPtr          = fs.String("trackId",       "", "The Spotify trackid to play")
+    var deviceNamePtr       = fs.String("deviceName",    "", "The name of the device to play it on")
+    var callbackWaitTimePtr = fs.Int("callbackWait",     8,  "The seconds to wait for the authorization redirect/callback to our app")
 
     // Ingest configuration flags.
     // Commandline arguments > Environment variables
@@ -517,7 +520,7 @@ func main() {
 
     // TODO don't just wait a random time, kill the server + continue when the URL handler is called
     fmt.Println("Waiting for callback ...")
-    time.Sleep(8 * time.Second)
+    time.Sleep(time.Duration(*callbackWaitTimePtr) * time.Second)
 
     if err := srv.Shutdown(context.TODO()); err != nil {
         panic(err) // failure/timeout shutting down the server gracefully
